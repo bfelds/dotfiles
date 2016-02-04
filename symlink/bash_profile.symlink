@@ -1,0 +1,13 @@
+DOTFOLDER="$HOME/.dotfiles"
+
+SYSTEM_FILES=${DOTFOLDER}/system/.*
+for DOTFILE in $SYSTEM_FILES
+do
+  [ -f "$DOTFILE" ] && . "$DOTFILE"
+done
+
+#do path work
+export PATH=$PATH:$HOME/bin
+
+[ -f "$HOME/.proxies" ] && . "$HOME/.proxies"
+

@@ -1,0 +1,27 @@
+[user]
+	name = "Benjamin Feldman"
+	email = "bfeldman12@bloomberg.net"
+
+[http]
+	sslverify=false
+
+[alias]
+	ld = log --pretty=format:"%C(green)%h\\ %ad%Cred%d\\ %Creset%s%Cblue\\ [%cn]" --decorate --date=relative
+	ll = log --pretty=format:"%C(green)%h%Cred%d\\ %Creset%s%Cblue\\ [%cn]" --decorate --numstat
+	gr = grep -Ii
+	alias = "!git config -l | grep alias | cut -c 7-"
+	co = checkout
+	br = for-each-ref --sort=-committerdate refs/heads/ --format='%(committerdate:short) %(refname:short)'
+	dc = diff --cached
+	ci = commit
+	st = status -s -uno
+	back = reset --soft HEAD^
+	g = grep --break --heading --line-number
+
+[rerere]
+	enabled = true
+
+[http "https://bbgithub.dev.bloomberg.com"]
+	sslVerify = false
+	proxy=http://bfeldman12@proxy.bloomberg.com:80
+

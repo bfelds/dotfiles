@@ -1,2 +1,3 @@
 alias l="ls -la"
 alias ld="ls -ld */"
+alias devssh='ssh devgw -t inline dev '

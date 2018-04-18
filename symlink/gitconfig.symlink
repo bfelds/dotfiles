@@ -20,8 +20,3 @@
 
 [rerere]
 	enabled = true
-
-[http "https://bbgithub.dev.bloomberg.com"]
-	sslVerify = false
-	proxy=http://bfeldman12@proxy.bloomberg.com:80
-

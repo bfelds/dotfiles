@@ -44,7 +44,7 @@ sudo chflags nohidden /Volumes
 
 # Set a really fast key repeat.
 defaults write NSGlobalDomain KeyRepeat -int 1
-defaults write NSGlobalDomain InitialKeyRepeat -int 10
+defaults write NSGlobalDomain InitialKeyRepeat -int 25
 
 # Adjust toolbar title rollover delay
 defaults write NSGlobalDomain NSToolbarTitleViewRolloverDelay -float 0
@@ -59,7 +59,7 @@ defaults write com.apple.print.PrintingPrefs "Quit When Finished" -bool true
 defaults write com.apple.LaunchServices LSQuarantine -bool false
 
 # Stop iTunes from responding to the keyboard media keys
-launchctl unload -w /System/Library/LaunchAgents/com.apple.rcd.plist 2> /dev/null
+# launchctl unload -w /System/Library/LaunchAgents/com.apple.rcd.plist 2> /dev/null
 
 # Reveal IP address, hostname, OS version, etc. when clicking the clock
 # in the login window
@@ -95,6 +95,7 @@ sudo systemsetup -setcomputersleep Off > /dev/null
 #    power failure.
 sudo pmset -a hibernatemode 0
 
+defaults write com.apple.mouse.scaling 5
 
 # Disable the warning before emptying the Trash
 defaults write com.apple.finder WarnOnEmptyTrash -bool false

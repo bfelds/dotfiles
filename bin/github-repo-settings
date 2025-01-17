@@ -1,0 +1,231 @@
+#!/bin/bash
+#
+# Apply standardized repository settings across all repositories in an organization
+# Requires GitHub CLI (gh) to be installed and authenticated
+
+# Default values
+ORG="harness-giving"
+COMMAND="secure-all"
+SPECIFIC_REPO=""
+
+usage() {
+    echo "Usage: github-repo-settings [options] COMMAND"
+    echo
+    echo "Commands:"
+    echo "  secure-all             Apply all recommended security and workflow settings (default)"
+    echo "  auto-merge            Enable auto-merge for pull requests"
+    echo "  auto-delete          Enable automatic deletion of head branches"
+    echo "  protect-default      Set up branch protection rules"
+    echo
+    echo "Options:"
+    echo "  -o, --org ORG        GitHub organization name (default: harness-giving)"
+    echo "  -r, --repo REPO      Apply to specific repository (format: owner/repo)"
+    echo "  -h, --help           Show this help message"
+    echo
+    echo "Examples:"
+    echo "  github-repo-settings secure-all"
+    echo "  github-repo-settings --org other-org secure-all"
+    echo "  github-repo-settings --repo harness-giving/my-repo secure-all"
+    exit 1
+}
+
+apply_branch_protection() {
+    local repo=$1
+    local default_branch=$(gh api "repos/$repo" --jq .default_branch)
+    
+    # Check if branch protection already exists
+    if gh api "repos/$repo/branches/$default_branch/protection" --silent 2>/dev/null; then
+        echo "⚠️  Branch protection already exists for $repo:$default_branch - skipping"
+        return 2  # Return 2 to indicate skipped (not failed)
+    elif [ ! -z "$(gh api "repos/$repo/rulesets" --jq 'map(select(.name == "Default Branch Protection"))[0].id')" ]; then
+        echo "⚠️  Ruleset already exists for $repo - skipping"
+        return 2
+    fi
+    
+    echo "Setting up repository ruleset for $repo..."
+    
+    jq -n '{
+        repo: "$repo",
+        owner: "harness-giving",
+        name: "Default Branch Protection",
+        target: "branch",
+        enforcement: "active",
+        conditions: {
+            ref_name: {
+                include: ["refs/heads/main", "refs/heads/master"],
+                exclude: []
+            }
+        },
+        rules: [
+            {
+                type: "pull_request",
+                parameters: {
+                    allowed_merge_methods: ["merge", "squash"],
+                    dismiss_stale_reviews_on_push: false,
+                    require_code_owner_review: false,
+                    required_approving_review_count: 1,
+                    require_last_push_approval: false,
+                    required_review_thread_resolution: false
+                }
+            }
+        ],
+        bypass_actors: [
+            {
+                actor_id: 1,
+                actor_type: "OrganizationAdmin",
+                bypass_mode: "always"
+            }
+        ]
+    }' | gh api -X POST "repos/$repo/rulesets" --input - --silent
+}
+
+apply_repo_settings() {
+    local repo=$1
+    local settings=$2
+    
+    # Enable Dependabot alerts and security updates
+    echo "Enabling Dependabot and security settings..."
+    gh api -X PUT "repos/$repo/vulnerability-alerts" --silent
+    gh api -X PUT "repos/$repo/automated-security-fixes" --silent
+    
+    
+    # Configure repository settings
+    echo "Configuring repository settings..."
+    jq -n '{
+        allow_auto_merge: true,
+        delete_branch_on_merge: true,
+        allow_merge_commit: true,
+        allow_squash_merge: true,
+        allow_rebase_merge: false,
+        squash_merge_commit_title: "PR_TITLE",
+        squash_merge_commit_message: "PR_BODY",
+        allow_update_branch: true,
+        security_and_analysis: {
+            dependabot_security_updates: { status: "enabled" }
+        }
+    }' | gh api -X PATCH "repos/$repo" --input - --silent
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -o|--org)
+            ORG="$2"
+            shift 2
+            ;;
+        -r|--repo)
+            SPECIFIC_REPO="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        secure-all|auto-merge|auto-delete|protect-default)
+            COMMAND="$1"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Get all repositories in the organization
+if [ -n "$SPECIFIC_REPO" ]; then
+    echo "Targeting specific repository: $SPECIFIC_REPO"
+    # Verify the repository exists and is accessible
+    if ! gh repo view "$SPECIFIC_REPO" &>/dev/null; then
+        echo "Error: Repository $SPECIFIC_REPO not found or not accessible"
+        exit 1
+    fi
+    repos="$SPECIFIC_REPO"
+else
+    echo "Fetching repositories from $ORG..."
+    repos=$(gh repo list $ORG --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+fi
+
+if [ -z "$repos" ]; then
+    echo "No repositories found or error accessing GitHub API"
+    exit 1
+fi
+
+# Counter for successful updates
+declare -i success_count=0
+declare -i skipped_count=0
+declare -a failed_repos=()
+declare -a skipped_repos=()
+
+# Process each repository
+for repo in $repos; do
+    echo "Updating settings for $repo..."
+    
+    case $COMMAND in
+        secure-all)
+            echo "Applying all security and workflow settings..."
+            # Apply settings one by one to handle skipped cases
+            apply_repo_settings "$repo"
+            repo_settings_status=$?
+            
+            apply_branch_protection "$repo"
+            protection_status=$?
+            
+            if [ $protection_status -eq 2 ]; then
+                ((skipped_count++))
+                skipped_repos+=("$repo")
+            elif [ $repo_settings_status -eq 0 ] && [ $protection_status -eq 0 ]; then
+                ((success_count++))
+                echo "✓ All settings applied successfully to $repo"
+            else
+                failed_repos+=("$repo")
+                echo "✗ Failed to apply all settings to $repo"
+            fi
+            ;;
+        auto-merge)
+            if gh api -X PATCH "repos/$repo" -f allow_auto_merge=true --silent; then
+                ((success_count++))
+                echo "✓ Auto-merge enabled for $repo"
+            else
+                failed_repos+=("$repo")
+                echo "✗ Failed to enable auto-merge for $repo"
+            fi
+            ;;
+        auto-delete)
+            if gh api -X PATCH "repos/$repo" -f delete_branch_on_merge=true --silent; then
+                ((success_count++))
+                echo "✓ Auto-delete enabled for $repo"
+            else
+                failed_repos+=("$repo")
+                echo "✗ Failed to enable auto-delete for $repo"
+            fi
+            ;;
+        protect-default)
+            if apply_branch_protection "$repo"; then
+                ((success_count++))
+                echo "✓ Branch protection rules set for $repo"
+            else
+                failed_repos+=("$repo")
+                echo "✗ Failed to set branch protection rules for $repo"
+            fi
+            ;;
+    esac
+done
+
+# Print summary
+echo -e "\n=== Summary ==="
+echo "Successfully updated $success_count repositories"
+[ $skipped_count -gt 0 ] && echo "Skipped $skipped_count repositories (already configured)"
+
+if [ ${#failed_repos[@]} -gt 0 ]; then
+    echo -e "\nFailed repositories:"
+    for repo in "${failed_repos[@]}"; do
+        echo "- $repo"
+    done
+fi
+
+if [ ${#skipped_repos[@]} -gt 0 ]; then
+    echo -e "\nSkipped repositories (already have branch protection):"
+    for repo in "${skipped_repos[@]}"; do
+        echo "- $repo"
+    done
+fi 

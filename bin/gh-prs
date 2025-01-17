@@ -1,0 +1,196 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# Check if GitHub CLI is installed
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI is not installed. Please install it first:"
+    echo "https://cli.github.com/manual/installation"
+    exit 1
+fi
+
+# Check if user is authenticated
+if ! gh auth status &> /dev/null; then
+    echo "Please authenticate with GitHub first:"
+    echo "gh auth login"
+    exit 1
+fi
+
+# Function to show usage
+show_usage() {
+    echo "Usage: gh-prs [repository_filter] [flags]"
+    echo "  repository_filter: Optional. Show PRs only for repositories matching this pattern"
+    echo "  Example: gh-prs api    # Shows PRs only for repositories containing 'api'"
+    echo ""
+    echo "Flags:"
+    echo "  -m, --mine    Show only PRs created by you"
+    echo "  -p, --pending Show repos with commits ahead of latest release"
+    echo "  -r, --repo REPO  Show info for specific repo (format: repo-name)"
+    echo "  -d, --days DAYS  Only show repos not released in specified days"
+    exit 1
+}
+
+# Handle help flag
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    show_usage
+fi
+
+# Parse flags
+SHOW_MINE=false
+SHOW_PENDING=false
+REPO_FILTER=""
+SINGLE_REPO=""
+DAYS_THRESHOLD=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -m|--mine)
+            SHOW_MINE=true
+            shift
+            ;;
+        -p|--pending)
+            SHOW_PENDING=true
+            shift
+            ;;
+        -r|--repo)
+            SINGLE_REPO="$2"
+            shift 2
+            ;;
+        -d|--days)
+            DAYS_THRESHOLD="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            REPO_FILTER="$1"
+            shift
+            ;;
+    esac
+done
+
+# Function to calculate time difference
+get_time_diff() {
+    local created_date=$1
+    local now=$(date +%s)
+    local created=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created_date" +%s)
+    local diff=$((now - created))
+    
+    local days=$((diff / 86400))
+    local hours=$(((diff % 86400) / 3600))
+    
+    if [ $days -gt 0 ]; then
+        echo "${days}d ${hours}h"
+    else
+        echo "${hours}h"
+    fi
+}
+
+# Function to check if date is older than threshold
+is_older_than_days() {
+    local date_str=$1
+    local days=$2
+    local now=$(date +%s)
+    local date_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$date_str" +%s)
+    local diff_days=$(( (now - date_ts) / 86400 ))
+    
+    [ $diff_days -ge $days ]
+    return $?
+}
+
+# Function to check pending releases
+check_pending_release() {
+    local repo=$1
+    local default_branch=$(gh api "repos/$repo" --jq .default_branch)
+    
+    # Get latest release tag
+    local latest_release_info=$(gh api "repos/$repo/releases/latest" --jq '{tag_name, published_at}' 2>/dev/null)
+    local latest_release=$(echo "$latest_release_info" | jq -r '.tag_name')
+    local published_at=$(echo "$latest_release_info" | jq -r '.published_at')
+    
+    if [ "$latest_release" = "null" ] || [ -z "$latest_release" ]; then
+        return
+    fi
+    
+    # If days threshold is set, check if release is older than threshold
+    if [ -n "$DAYS_THRESHOLD" ]; then
+        if ! is_older_than_days "$published_at" "$DAYS_THRESHOLD"; then
+            return
+        fi
+    fi
+    
+    # Get comparison between latest release and default branch
+    local comparison=$(gh api "repos/$repo/compare/$latest_release...$default_branch" --jq '{
+        ahead: .ahead_by,
+        status: .status,
+        commits: [.commits[] | {
+            sha: .sha[0:7],
+            message: .commit.message | split("\n")[0],
+            author: .commit.author.name,
+            date: .commit.author.date
+        }]
+    }')
+    
+    local ahead_by=$(echo "$comparison" | jq -r '.ahead')
+    
+    if [ "$ahead_by" -gt 0 ]; then
+        echo "📦 $repo"
+        echo "   Latest release: $latest_release ($(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$published_at" "+%Y-%m-%d"))"
+        echo "   $ahead_by commits ahead of release:"
+        echo "$comparison" | jq -r '.commits[] | "   • \(.sha) \(.message) - \(.author) (\(.date | fromdate | strftime("%Y-%m-%d")))"'
+        echo
+    fi
+}
+
+# Get all repositories in Harness-Giving organization
+echo "Fetching repositories from Harness-Giving organization..."
+if [ -n "$SINGLE_REPO" ]; then
+    # If specific repo provided, use exact match
+    repos="harness-giving/$SINGLE_REPO"
+    # Verify repo exists
+    if ! gh repo view "$repos" &>/dev/null; then
+        echo "Error: Repository $repos not found or not accessible"
+        exit 1
+    fi
+elif [ -n "$REPO_FILTER" ]; then
+    # If filter provided, use it in jq
+    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
+        jq -r --arg filter "$REPO_FILTER" '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech" and contains($filter))')
+else
+    # No filter, just exclude harness-martech
+    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
+        jq -r '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech")')
+fi
+
+# Get current user's login
+if [ "$SHOW_MINE" = true ]; then
+    current_user=$(gh api user --jq '.login')
+fi
+
+# Loop through each repository
+if [ "$SHOW_PENDING" = true ]; then
+    echo -e "\nChecking for pending releases...\n"
+    for repo in $repos; do
+        check_pending_release "$repo"
+    done
+else
+    echo -e "\nFetching open pull requests...\n"
+    for repo in $repos; do
+        if [ "$SHOW_MINE" = true ]; then
+            prs=$(gh pr list --repo "$repo" --state open --author "@me" --json number,title,author,createdAt,url --jq '.[]')
+        else
+            prs=$(gh pr list --repo "$repo" --state open --json number,title,author,createdAt,url --jq '.[]')
+        fi
+        if [ ! -z "$prs" ]; then
+            echo "📦 $repo"
+            while IFS= read -r pr; do
+                created_at=$(echo "$pr" | jq -r '.createdAt')
+                time_open=$(get_time_diff "$created_at")
+                echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    🔗 \(.url)\n"'
+            done <<< "$prs"
+            echo
+        fi
+    done
+fi 

@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# Check if GitHub CLI is installed
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI is not installed. Please install it first:"
+    echo "https://cli.github.com/manual/installation"
+    exit 1
+fi
+
+# Check if user is authenticated
+if ! gh auth status &> /dev/null; then
+    echo "Please authenticate with GitHub first:"
+    echo "gh auth login"
+    exit 1
+fi
+
+# Default values
+SINGLE_REPO=""
+QUARTER="Q4"
+YEAR=$(date +"%Y")
+
+# Function to show usage
+show_usage() {
+    echo "Usage: gh-release-notes [flags]"
+    echo ""
+    echo "Flags:"
+    echo "  -r, --repo REPO      Show releases for specific repo (format: repo-name)"
+    echo "  -q, --quarter QN     Quarter to analyze (Q1, Q2, Q3, Q4) (default: Q4)"
+    echo "  -y, --year YYYY      Year to analyze (default: current year)"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  gh-release-notes              # Show Q4 releases for current year"
+    echo "  gh-release-notes -q Q3 -y 2023  # Show Q3 2023 releases"
+    echo "  gh-release-notes -r proto     # Show Q4 releases for proto repo"
+    exit 1
+}
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -r|--repo)
+            SINGLE_REPO="$2"
+            shift 2
+            ;;
+        -q|--quarter)
+            case "$2" in
+                Q1|Q2|Q3|Q4)
+                    QUARTER="$2"
+                    shift 2
+                    ;;
+                *)
+                    echo "Error: Invalid quarter. Use Q1, Q2, Q3, or Q4"
+                    show_usage
+                    ;;
+            esac
+            ;;
+        -y|--year)
+            if [[ "$2" =~ ^[0-9]{4}$ ]]; then
+                YEAR="$2"
+                shift 2
+            else
+                echo "Error: Invalid year format. Use YYYY"
+                show_usage
+            fi
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_usage
+            ;;
+    esac
+done
+
+# Function to get quarter date range
+get_quarter_dates() {
+    case "$QUARTER" in
+        Q1)
+            START_DATE="$YEAR-01-01T00:00:00Z"
+            END_DATE="$YEAR-03-31T23:59:59Z"
+            ;;
+        Q2)
+            START_DATE="$YEAR-04-01T00:00:00Z"
+            END_DATE="$YEAR-06-30T23:59:59Z"
+            ;;
+        Q3)
+            START_DATE="$YEAR-07-01T00:00:00Z"
+            END_DATE="$YEAR-09-30T23:59:59Z"
+            ;;
+        Q4)
+            START_DATE="$YEAR-10-01T00:00:00Z"
+            END_DATE="$YEAR-12-31T23:59:59Z"
+            ;;
+    esac
+}
+
+get_quarter_dates
+echo "Fetching releases from $START_DATE to $END_DATE..."
+
+# Get repositories
+if [ -n "$SINGLE_REPO" ]; then
+    repos="harness-giving/$SINGLE_REPO"
+    # Verify repo exists
+    if ! gh repo view "$repos" &>/dev/null; then
+        echo "Error: Repository $repos not found or not accessible"
+        exit 1
+    fi
+else
+    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
+        jq -r '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech")')
+fi
+
+# Function to format release notes
+format_release() {
+    local repo=$1
+    local releases=$2
+    
+    if [ -n "$releases" ]; then
+        echo "📦 $repo"
+        echo "$releases" | jq -r '
+            .[] | 
+            "  🏷️  \(.tag_name) (\(.published_at | fromdate | strftime("%Y-%m-%d")))\n" +
+            (if .name then "  📝 \(.name)\n" else "" end) +
+            if .body then
+                "  \(.body | gsub("\n"; "\n  "))\n"
+            else 
+                "  No release notes provided\n"
+            end + "\n"
+        '
+    fi
+}
+
+# Track if we found any releases
+found_releases=false
+
+# Process each repository
+for repo in $repos; do
+    echo "Checking releases for $repo..."
+    
+    # Get all releases in the date range
+    releases=$(gh api "repos/$repo/releases" --jq "
+        [.[] | 
+        select(
+            .published_at >= \"$START_DATE\" and 
+            .published_at <= \"$END_DATE\"
+        ) | {
+            tag_name,
+            name,
+            body,
+            published_at
+        }
+    ]")
+    
+    # If we found releases, format and display them
+    if [ "$(echo "$releases" | jq '. | length')" -gt 0 ]; then
+        found_releases=true
+        format_release "$repo" "$releases"
+    fi
+done
+
+# If no releases were found, show a message
+if [ "$found_releases" = false ]; then
+    echo -e "\nNo releases found in $QUARTER $YEAR"
+fi 

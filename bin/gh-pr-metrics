@@ -1,0 +1,254 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# Check if GitHub CLI is installed
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI is not installed. Please install it first:"
+    echo "https://cli.github.com/manual/installation"
+    exit 1
+fi
+
+# Check if user is authenticated
+if ! gh auth status &> /dev/null; then
+    echo "Please authenticate with GitHub first:"
+    echo "gh auth login"
+    exit 1
+fi
+
+# Parse flags
+SINGLE_REPO=""
+PR_LIMIT=""  # No default limit
+TIMEFRAME="1m"  # Default to 1 month
+USE_CACHE=false
+CACHE_DIR="/tmp/gh-pr-metrics"
+mkdir -p "$CACHE_DIR"
+
+# Function to show usage
+show_usage() {
+    echo "Usage: gh-pr-metrics [flags]"
+    echo ""
+    echo "Flags:"
+    echo "  -r, --repo REPO       Show metrics for specific repo (format: repo-name)"
+    echo "  -l, --limit N         Limit number of PRs to check (default: no limit)"
+    echo "  -t, --timeframe TIME  Time period to analyze: 2w, 1m, 1y (default: 1m)"
+    echo "      --use-cache       Use cached data if available (cache valid for 1 hour)"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "Timeframes:"
+    echo "  2w: Last 2 weeks"
+    echo "  1m: Last month"
+    echo "  1y: Last year"
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -r|--repo)
+            SINGLE_REPO="$2"
+            shift 2
+            ;;
+        -l|--limit)
+            PR_LIMIT="$2"
+            shift 2
+            ;;
+        -t|--timeframe)
+            case "$2" in
+                2w|1m|1y)
+                    TIMEFRAME="$2"
+                    shift 2
+                    ;;
+                *)
+                    echo "Error: Invalid timeframe. Use 2w, 1m, or 1y"
+                    show_usage
+                    ;;
+            esac
+            ;;
+        --use-cache)
+            USE_CACHE=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_usage
+            ;;
+    esac
+done
+
+# Calculate start date based on timeframe
+get_start_date() {
+    case "$TIMEFRAME" in
+        2w)
+            date -v-2w -u +"%Y-%m-%dT%H:%M:%SZ"
+            ;;
+        1m)
+            date -v-1m -u +"%Y-%m-%dT%H:%M:%SZ"
+            ;;
+        1y)
+            date -v-1y -u +"%Y-%m-%dT%H:%M:%SZ"
+            ;;
+    esac
+}
+
+START_DATE=$(get_start_date)
+
+# Get time period description for display
+get_time_description() {
+    case "$TIMEFRAME" in
+        2w) echo "two weeks";;
+        1m) echo "month";;
+        1y) echo "year";;
+    esac
+}
+
+echo "Analyzing PRs since $START_DATE (last $(get_time_description))..."
+
+# Get all repositories in Harness-Giving organization
+echo "Fetching repositories from Harness-Giving organization..."
+if [ -n "$SINGLE_REPO" ]; then
+    # If specific repo provided, use exact match
+    repos="harness-giving/$SINGLE_REPO"
+    # Verify repo exists
+    if ! gh repo view "$repos" &>/dev/null; then
+        echo "Error: Repository $repos not found or not accessible"
+        exit 1
+    fi
+else
+    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
+        jq -r '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech")')
+fi
+
+# Initialize temporary files
+PR_DATA=$(mktemp)
+REVIEW_DATA=$(mktemp)
+
+# Cleanup on exit
+trap 'rm -f "$PR_DATA" "$REVIEW_DATA"' EXIT
+
+# Collect PR data for all repos
+for repo in $repos; do
+    echo "Fetching PR data for $repo..."
+    
+    # Build API URL with or without limit
+    if [ -n "$PR_LIMIT" ]; then
+        pr_query="repos/$repo/pulls?state=all&sort=updated&direction=desc&per_page=$PR_LIMIT"
+    else
+        pr_query="repos/$repo/pulls?state=all&sort=updated&direction=desc"
+    fi
+    gh api "$pr_query" --jq "
+        [.[] | select(.created_at >= \"$START_DATE\") | {
+            number,
+            author: .user.login,
+            created_at,
+            closed_at,
+            merged_at,
+            state
+        }]
+    " >> "$PR_DATA"
+    
+    # Get review data for each PR
+    for pr_number in $(gh api "$pr_query" --jq "
+        [.[] | select(.created_at >= \"$START_DATE\").number][]
+    "); do
+        # echo "  Fetching reviews for PR #$pr_number..."
+        gh api "repos/$repo/pulls/$pr_number/reviews" --jq "
+            [.[] | {
+                reviewer: .user.login,
+                submitted_at: .submitted_at,
+                pr_created_at: \"$(gh api "repos/$repo/pulls/$pr_number" --jq .created_at)\"
+            }]
+        " >> "$REVIEW_DATA" || true
+    done
+done
+
+echo -e "\n📊 PR Author Statistics:"
+# Check if there are any PRs
+if [ ! -s "$PR_DATA" ]; then
+    echo "  No PRs found in this time period"
+fi
+
+jq -s 'flatten | group_by(.author) | map({
+    author: .[0].author,
+    total_prs: length,
+    merged_prs: map(select(.merged_at != null)) | length,
+    avg_time_to_merge: (
+        map(
+            select(.merged_at != null) | 
+            (
+                (
+                    (.merged_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+                    (.created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)) / 86400
+            )
+        ) | 
+        if length > 0 then (add / length) else 0 end
+    )
+}) | sort_by(-.total_prs)[]' "$PR_DATA" | \
+jq -r '"  👤 \(.author)\n    Total PRs: \(.total_prs)\n    Merged PRs: \(.merged_prs)\n    Avg Time to Merge: \(.avg_time_to_merge | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n"'
+
+echo -e "\n📈 Team Statistics:"
+jq -s 'flatten | {
+    total_prs: length,
+    merged_prs: map(select(.merged_at != null)) | length,
+    active_authors: group_by(.author) | length,
+    avg_time_to_merge: (
+        map(
+            select(.merged_at != null) | 
+            (
+                (
+                    (.merged_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+                    (.created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)) / 86400
+                )
+            ) | 
+            if length > 0 then (add / length) else 0 end
+        ),
+        pr_velocity: (length * 7.0 / (if $timeframe == "2w" then 14 elif $timeframe == "1y" then 365 else 30 end)),  # PRs per week
+        merge_rate: (if length > 0 then ((map(select(.merged_at != null)) | length) / length * 100) else 0 end)
+    }' --arg timeframe "$TIMEFRAME" "$PR_DATA" | \
+    jq -r '"  📊 Overview:\n    Total PRs: \(.total_prs)\n    Merged PRs: \(.merged_prs)\n    Active Contributors: \(.active_authors)\n    Avg Time to Merge: \(.avg_time_to_merge | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n    PR Velocity: \(.pr_velocity | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end) PRs/week\n    Merge Rate: \(.merge_rate | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)%\n"'
+
+echo -e "\n👀 Reviewer Statistics:"
+jq -s '
+    flatten | 
+    group_by(.reviewer) | 
+    map({
+        reviewer: .[0].reviewer,
+        total_reviews: length,
+        review_times: map(
+            (.submitted_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+            (.pr_created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+        ),
+        avg_time_to_review: (
+            if length > 0 then
+                (map(
+                    (.submitted_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+                    (.pr_created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                ) | add / (length * 86400))
+            else 0 end
+        )
+    }) | 
+    sort_by(-.total_reviews)[]
+' "$REVIEW_DATA" | \
+jq -r '"  👤 \(.reviewer)\n    Total Reviews: \(.total_reviews)\n    Avg Time to Review: \(.avg_time_to_review | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n"'
+
+echo -e "\n📈 Review Team Statistics:"
+jq -s '
+    flatten |
+    {
+        total_reviews: length,
+        active_reviewers: (group_by(.reviewer) | length),
+        avg_time_to_review: (
+            if length > 0 then
+                (map(
+                    (.submitted_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) -
+                    (.pr_created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)
+                ) | add / (length * 86400))
+            else 0 end
+        ),
+        reviews_per_week: (length * 7.0 / (if $timeframe == "2w" then 14 elif $timeframe == "1y" then 365 else 30 end))  # Reviews per week
+    }
+' --arg timeframe "$TIMEFRAME" "$REVIEW_DATA" | \
+jq -r '"  📊 Overview:\n    Total Reviews: \(.total_reviews)\n    Active Reviewers: \(.active_reviewers)\n    Avg Time to Review: \(.avg_time_to_review | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n    Review Velocity: \(.reviews_per_week | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end) reviews/week\n"' 

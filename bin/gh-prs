@@ -25,6 +25,7 @@ show_usage() {
     echo ""
     echo "Flags:"
     echo "  -m, --mine    Show only PRs created by you"
+    echo "  -i, --involved Show PRs where you're involved (subscribed/assigned)"
     echo "  -p, --pending Show repos with commits ahead of latest release"
     echo "  -r, --repo REPO  Show info for specific repo (format: repo-name)"
     echo "  -d, --days DAYS  Only show repos not released in specified days"
@@ -38,6 +39,7 @@ fi
 
 # Parse flags
 SHOW_MINE=false
+SHOW_INVOLVED=false
 SHOW_PENDING=false
 REPO_FILTER=""
 SINGLE_REPO=""
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -m|--mine)
             SHOW_MINE=true
+            shift
+            ;;
+        -i|--involved)
+            SHOW_INVOLVED=true
             shift
             ;;
         -p|--pending)
@@ -180,15 +186,48 @@ else
     for repo in $repos; do
         if [ "$SHOW_MINE" = true ]; then
             prs=$(gh pr list --repo "$repo" --state open --author "@me" --json number,title,author,createdAt,url --jq '.[]')
+        elif [ "$SHOW_INVOLVED" = true ]; then
+            # Get PRs where you're involved (commented, reviewed, or assigned)
+            current_user=$(gh api user --jq '.login')
+            echo "Fetching PRs where you're involved for $repo..."
+            # Get open PRs
+            echo "Fetching open PRs for $repo..."
+            open_prs=$(gh api "repos/$repo/pulls?state=open")
+            
+            # Filter for PRs where user is assigned or reviewer
+            echo "Filtering PRs for user $current_user..."
+            filtered_prs=$(echo "$open_prs" | jq --arg user "$current_user" '
+                [.[] | select(
+                    (.assignees | map(.login) | contains([$user])) or
+                    ((.requested_reviewers // []) | map(.login) | contains([$user]))
+                )] | unique_by(.number)
+            ')
+            
+            # Format the PR data
+            echo "Formatting PR data..."
+            prs=$(echo "$filtered_prs" | jq '[.[] | {
+                number,
+                title,
+                author: .user,
+                createdAt: .created_at,
+                url: .html_url,
+                assignees: [.assignees[].login] | select(length > 0),
+                reviewers: [(.requested_reviewers // [])[].login] | select(length > 0)
+            }][]')
         else
             prs=$(gh pr list --repo "$repo" --state open --json number,title,author,createdAt,url --jq '.[]')
         fi
         if [ ! -z "$prs" ]; then
             echo "📦 $repo"
             while IFS= read -r pr; do
+                echo "$pr"
                 created_at=$(echo "$pr" | jq -r '.createdAt')
                 time_open=$(get_time_diff "$created_at")
-                echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    🔗 \(.url)\n"'
+                if [ "$SHOW_INVOLVED" = true ]; then
+                    echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    👥 Assignees: \(.assignees | join(", "))\n    👀 Reviewers: \(.reviewers | join(", "))\n    🔗 \(.url)\n"'
+                else
+                    echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    🔗 \(.url)\n"'
+                fi
             done <<< "$prs"
             echo
         fi

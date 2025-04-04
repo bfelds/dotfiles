@@ -1,0 +1,125 @@
+#!/bin/bash
+
+# Function to show usage
+show_usage() {
+    echo "Usage: gh-security-alerts [flags]"
+    echo ""
+    echo "Flags:"
+    echo "  -r, --repo REPO    Show alerts for specific repo (format: repo-name)"
+    echo "  -c, --csv         Output in CSV format"
+    echo "  -H, --high-risk   Show only high and critical severity alerts"
+    echo "  -h, --help        Show this help message"
+    exit 1
+}
+
+# Parse command line arguments
+SINGLE_REPO=""
+CSV_OUTPUT=false
+HIGH_RISK_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -r|--repo)
+            SINGLE_REPO="$2"
+            shift 2
+            ;;
+        -c|--csv)
+            CSV_OUTPUT=true
+            shift
+            ;;
+        -H|--high-risk)
+            HIGH_RISK_ONLY=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_usage
+            ;;
+    esac
+done
+
+# Function to get repository list
+get_repos() {
+    if [ -n "$SINGLE_REPO" ]; then
+        # For single repo, check if it's archived first
+        is_archived=$(gh api "repos/Harness-Giving/$SINGLE_REPO" --jq '.archived')
+        if [ "$is_archived" = "true" ]; then
+            return
+        fi
+        echo "$SINGLE_REPO"
+    else
+        # Filter out archived repositories
+        gh api orgs/Harness-Giving/repos --paginate --jq '[.[] | select(.archived == false) | .name][]'
+    fi
+}
+
+echo "Fetching repositories from Harness-Giving organization..."
+repos=$(get_repos)
+
+if [ "$CSV_OUTPUT" = true ]; then
+    echo "Repository,Package,Severity,GHSA ID,Published,URL"
+fi
+
+# Process each repository
+for repo in $repos; do
+    # Get security alerts for the repository
+    alerts=$(gh api "repos/Harness-Giving/$repo/dependabot/alerts?state=open" --jq "
+        [.[] | select(.state == \"open\") | 
+        select(
+            if \"$HIGH_RISK_ONLY\" == \"true\" then
+                .security_advisory.severity == \"critical\" or .security_advisory.severity == \"high\"
+            else
+                true
+            end
+        ) | {
+            package: .dependency.package.name,
+            severity: .security_advisory.severity,
+            ghsa_id: .security_advisory.ghsa_id,
+            published: .security_advisory.published_at,
+            html_url: .html_url
+        }][]
+    ")
+    
+    if [ -z "$alerts" ]; then
+        continue
+    fi
+
+    # Only show repo header if we have alerts and not in CSV mode
+    if [ "$CSV_OUTPUT" = false ]; then
+        echo -e "\n📦 $repo"
+    fi
+    
+    echo "$alerts" | while IFS= read -r alert; do
+        if [ -n "$alert" ]; then
+            if [ "$CSV_OUTPUT" = true ]; then
+                # CSV format
+                echo "$repo,$(echo "$alert" | jq -r '[.package, .severity, .ghsa_id, .published, .html_url] | @csv')"
+            else
+                # Human readable format
+                package=$(echo "$alert" | jq -r .package)
+                severity=$(echo "$alert" | jq -r .severity)
+                ghsa_id=$(echo "$alert" | jq -r .ghsa_id)
+                published=$(echo "$alert" | jq -r .published)
+                url=$(echo "$alert" | jq -r .html_url)
+                
+                # Convert severity to emoji
+                case "$severity" in
+                    "critical") severity_emoji="🔴";;
+                    "high") severity_emoji="🟠";;
+                    "medium") severity_emoji="🟡";;
+                    "low") severity_emoji="🟢";;
+                    *) severity_emoji="⚪";;
+                esac
+                
+                # Format date
+                published_date=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$published" "+%Y-%m-%d" 2>/dev/null || echo "$published")
+                
+                echo "  $severity_emoji $package ($ghsa_id) - Published: $published_date"
+                echo "    🔗 $url"
+            fi
+        fi
+    done
+done 

@@ -29,6 +29,7 @@ show_usage() {
     echo "  -p, --pending Show repos with commits ahead of latest release"
     echo "  -r, --repo REPO  Show info for specific repo (format: repo-name)"
     echo "  -d, --days DAYS  Only show repos not released in specified days"
+    echo "  -a, --approve [PR_NUMBER]  Approve a PR. If PR number is omitted, shows interactive selection"
     exit 1
 }
 
@@ -44,6 +45,8 @@ SHOW_PENDING=false
 REPO_FILTER=""
 SINGLE_REPO=""
 DAYS_THRESHOLD=""
+APPROVE_PR=""
+APPROVE_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -67,6 +70,14 @@ while [[ $# -gt 0 ]]; do
             DAYS_THRESHOLD="$2"
             shift 2
             ;;
+        -a|--approve)
+            APPROVE_MODE=true
+            if [ -n "$2" ] && [[ ! "$2" =~ ^- ]]; then
+                APPROVE_PR="$2"
+                shift
+            fi
+            shift
+            ;;
         -h|--help)
             show_usage
             ;;
@@ -76,6 +87,203 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Get all repositories in Harness-Giving organization
+echo "Fetching repositories from Harness-Giving organization..."
+if [ -n "$SINGLE_REPO" ]; then
+    # If specific repo provided, use exact match
+    repos="harness-giving/$SINGLE_REPO"
+    # Verify repo exists and is not archived
+    repo_info=$(gh api "repos/$repos" --jq '{archived}' 2>/dev/null)
+    if [ -z "$repo_info" ]; then
+        echo "Error: Repository $repos not found or not accessible"
+        exit 1
+    elif [ "$(echo "$repo_info" | jq -r '.archived')" = "true" ]; then
+        echo "Error: Repository $repos is archived"
+        exit 1
+    fi
+elif [ -n "$REPO_FILTER" ]; then
+    # If filter provided, use it in jq and exclude archived repos
+    repos=$(gh repo list Harness-Giving --json nameWithOwner,isArchived | \
+        jq -r --arg filter "$REPO_FILTER" '.[] | 
+        select(
+            .nameWithOwner != "Harness-Giving/harness-martech" and 
+            .nameWithOwner != "Harness-Giving/cfw-martech" and 
+            .nameWithOwner | contains($filter) and 
+            .isArchived == false
+        ) | .nameWithOwner')
+else
+    # No filter, exclude specific repos and archived ones
+    repos=$(gh repo list Harness-Giving --json nameWithOwner,isArchived | \
+        jq -r '.[] | 
+        select(
+            .nameWithOwner != "Harness-Giving/harness-martech" and 
+            .nameWithOwner != "Harness-Giving/cfw-martech" and 
+            .isArchived == false
+        ) | .nameWithOwner')
+fi
+
+# Get current user's login
+if [ "$SHOW_MINE" = true ]; then
+    current_user=$(gh api user --jq '.login')
+fi
+
+# Handle PR approval if requested
+if [ "$APPROVE_MODE" = true ] && [ -z "$APPROVE_PR" ]; then
+    # Get all PRs that match current filters and store in temp file
+    temp_file=$(mktemp)
+    
+    echo "Fetching pull requests for approval..."
+    
+    for repo in $repos; do
+        if [ "$SHOW_MINE" = true ]; then
+            current_user=$(gh api user --jq '.login')
+            open_prs=$(gh api "repos/$repo/pulls?state=open")
+            
+            # For each PR, get its reviews
+            prs_with_reviews=$(echo "$open_prs" | jq -c '.[]' | while IFS= read -r pr; do
+                pr_number=$(echo "$pr" | jq -r '.number')
+                reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews")
+                echo "$pr" | jq --argjson reviews "$reviews" '. + {reviews: $reviews}'
+            done | jq -s '.')
+            
+            prs=$(echo "$prs_with_reviews" | jq --arg user "$current_user" '
+                [.[] | select(
+                    .user.login == $user and
+                    (.draft | not)
+                ) | {
+                    repo: "'$repo'",
+                    number,
+                    title,
+                    author: .user.login,
+                    reviews: (
+                        [.reviews[] | {state}] | 
+                        if length == 0 then "pending"
+                        elif any(.state == "CHANGES_REQUESTED") then "changes_requested"
+                        elif any(.state == "APPROVED") then "approved"
+                        else "pending"
+                        end
+                    )
+                }]')
+        elif [ "$SHOW_INVOLVED" = true ]; then
+            current_user=$(gh api user --jq '.login')
+            open_prs=$(gh api "repos/$repo/pulls?state=open")
+            
+            # For each PR, get its reviews
+            prs_with_reviews=$(echo "$open_prs" | jq -c '.[]' | while IFS= read -r pr; do
+                pr_number=$(echo "$pr" | jq -r '.number')
+                reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews")
+                echo "$pr" | jq --argjson reviews "$reviews" '. + {reviews: $reviews}'
+            done | jq -s '.')
+            
+            prs=$(echo "$prs_with_reviews" | jq --arg user "$current_user" '
+                [.[] | select(
+                    (
+                        (.assignees | map(.login) | contains([$user])) or
+                        ((.requested_reviewers // []) | map(.login) | contains([$user]))
+                    ) and
+                    (.draft | not)
+                ) | {
+                    repo: "'$repo'",
+                    number,
+                    title,
+                    author: .user.login,
+                    reviews: (
+                        [.reviews[] | {state}] | 
+                        if length == 0 then "pending"
+                        elif any(.state == "CHANGES_REQUESTED") then "changes_requested"
+                        elif any(.state == "APPROVED") then "approved"
+                        else "pending"
+                        end
+                    )
+                }]')
+        else
+            open_prs=$(gh api "repos/$repo/pulls?state=open")
+            
+            # For each PR, get its reviews
+            prs_with_reviews=$(echo "$open_prs" | jq -c '.[]' | while IFS= read -r pr; do
+                pr_number=$(echo "$pr" | jq -r '.number')
+                reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews")
+                echo "$pr" | jq --argjson reviews "$reviews" '. + {reviews: $reviews}'
+            done | jq -s '.')
+            
+            prs=$(echo "$prs_with_reviews" | jq '[.[] | select(.draft | not) | {
+                repo: "'$repo'",
+                number,
+                title,
+                author: .user.login,
+                reviews: (
+                    [.reviews[] | {state}] | 
+                    if length == 0 then "pending"
+                    elif any(.state == "CHANGES_REQUESTED") then "changes_requested"
+                    elif any(.state == "APPROVED") then "approved"
+                    else "pending"
+                    end
+                )
+            }]')
+        fi
+
+        if [ ! -z "$prs" ] && [ "$prs" != "[]" ]; then
+            echo "$prs" >> "$temp_file"
+        fi
+    done
+
+    # Combine all PRs and create a numbered list
+    all_prs=$(jq -s 'add' "$temp_file")
+    if [ -z "$all_prs" ] || [ "$all_prs" = "null" ] || [ "$all_prs" = "[]" ]; then
+        echo "No PRs found matching your criteria"
+        rm "$temp_file"
+        exit 1
+    fi
+
+    # Display numbered list of PRs with status icons
+    echo -e "\nSelect a PR to approve:"
+    echo "$all_prs" | jq -r 'to_entries | .[] | . as $entry | 
+        (if .value.reviews == "approved" then "✅" 
+         elif .value.reviews == "changes_requested" then "❌"
+         else "⏳" end) as $icon |
+        "\($entry.key + 1). \($icon) \($entry.value.repo) #\($entry.value.number): \($entry.value.title) by \($entry.value.author)"'
+
+    # Get user selection
+    read -p "Enter number (1-$(echo "$all_prs" | jq length)): " selection
+    
+    # Validate selection
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || \
+       [ "$selection" -lt 1 ] || \
+       [ "$selection" -gt $(echo "$all_prs" | jq length) ]; then
+        echo "Invalid selection"
+        rm "$temp_file"
+        exit 1
+    fi
+
+    # Get selected PR details
+    selected_pr=$(echo "$all_prs" | jq ".[$((selection-1))]")
+    SINGLE_REPO=$(echo "$selected_pr" | jq -r '.repo' | sed 's/harness-giving\///')
+    APPROVE_PR=$(echo "$selected_pr" | jq -r '.number')
+    
+    rm "$temp_file"
+fi
+
+if [ -n "$APPROVE_PR" ]; then
+    if [ -z "$SINGLE_REPO" ]; then
+        echo "Error: --repo flag is required when using --approve with a PR number"
+        exit 1
+    fi
+    
+    repo="harness-giving/$SINGLE_REPO"
+    echo "Approving PR #$APPROVE_PR in $repo..."
+    
+    # Verify PR exists and get its status
+    if ! gh pr view "$APPROVE_PR" --repo "$repo" &>/dev/null; then
+        echo "Error: PR #$APPROVE_PR not found in $repo"
+        exit 1
+    fi
+    
+    # Submit approval
+    gh pr review "$APPROVE_PR" --repo "$repo" --approve
+    echo "✅ Successfully approved PR #$APPROVE_PR"
+    exit 0
+fi
 
 # Function to calculate time difference
 get_time_diff() {
@@ -150,31 +358,6 @@ check_pending_release() {
     fi
 }
 
-# Get all repositories in Harness-Giving organization
-echo "Fetching repositories from Harness-Giving organization..."
-if [ -n "$SINGLE_REPO" ]; then
-    # If specific repo provided, use exact match
-    repos="harness-giving/$SINGLE_REPO"
-    # Verify repo exists
-    if ! gh repo view "$repos" &>/dev/null; then
-        echo "Error: Repository $repos not found or not accessible"
-        exit 1
-    fi
-elif [ -n "$REPO_FILTER" ]; then
-    # If filter provided, use it in jq
-    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
-        jq -r --arg filter "$REPO_FILTER" '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech" and contains($filter))')
-else
-    # No filter, just exclude harness-martech
-    repos=$(gh repo list Harness-Giving --json nameWithOwner | \
-        jq -r '.[].nameWithOwner | select(. != "Harness-Giving/harness-martech")')
-fi
-
-# Get current user's login
-if [ "$SHOW_MINE" = true ]; then
-    current_user=$(gh api user --jq '.login')
-fi
-
 # Loop through each repository
 if [ "$SHOW_PENDING" = true ]; then
     echo -e "\nChecking for pending releases...\n"
@@ -185,51 +368,144 @@ else
     echo -e "\nFetching open pull requests...\n"
     for repo in $repos; do
         if [ "$SHOW_MINE" = true ]; then
-            prs=$(gh pr list --repo "$repo" --state open --author "@me" --json number,title,author,createdAt,url --jq '.[]')
+            # Get PRs where you're the author
+            current_user=$(gh api user --jq '.login')
+            # Get open PRs
+            open_prs=$(gh api "repos/$repo/pulls?state=open")
+            
+            # For each PR, get its reviews
+            prs_with_reviews=$(echo "$open_prs" | jq -c '.[]' | while IFS= read -r pr; do
+                pr_number=$(echo "$pr" | jq -r '.number')
+                reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews")
+                echo "$pr" | jq --argjson reviews "$reviews" '. + {reviews: $reviews}'
+            done | jq -s '.')
+            
+            prs=$(echo "$prs_with_reviews" | jq --arg user "$current_user" --arg days "$DAYS_THRESHOLD" '
+                [.[] | select(
+                    .user.login == $user and
+                    (.draft | not) and
+                    (
+                        if ($days != "" and .created_at != null) then
+                            (now - ((.created_at | fromdateiso8601) // 0)) / 86400 >= ($days | tonumber)
+                        else true end
+                    )
+                ) | {
+                    number: (.number | tostring),
+                    title,
+                    author: (.user.login // "unknown"),
+                    createdAt: (.created_at // ""),
+                    url: (.html_url // ""),
+                    reviews: (
+                        [.reviews[] | {state, user: .user.login}] | 
+                        if length == 0 then "pending review"
+                        elif any(.state == "CHANGES_REQUESTED") then "changes requested"
+                        elif any(.state == "APPROVED") then "approved"
+                        else "pending review"
+                        end
+                    )
+                }] | select(length > 0)'
+            )
         elif [ "$SHOW_INVOLVED" = true ]; then
             # Get PRs where you're involved (commented, reviewed, or assigned)
             current_user=$(gh api user --jq '.login')
-            echo "Fetching PRs where you're involved for $repo..."
             # Get open PRs
-            echo "Fetching open PRs for $repo..."
             open_prs=$(gh api "repos/$repo/pulls?state=open")
             
-            # Filter for PRs where user is assigned or reviewer
-            echo "Filtering PRs for user $current_user..."
-            filtered_prs=$(echo "$open_prs" | jq --arg user "$current_user" '
-                [.[] | select(
-                    (.assignees | map(.login) | contains([$user])) or
-                    ((.requested_reviewers // []) | map(.login) | contains([$user]))
-                )] | unique_by(.number)
-            ')
+            # For each PR, get its reviews
+            prs_with_reviews=$(echo "$open_prs" | jq -c '.[]' | while IFS= read -r pr; do
+                pr_number=$(echo "$pr" | jq -r '.number')
+                reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews")
+                echo "$pr" | jq --argjson reviews "$reviews" '. + {reviews: $reviews}'
+            done | jq -s '.')
             
-            # Format the PR data
-            echo "Formatting PR data..."
-            prs=$(echo "$filtered_prs" | jq '[.[] | {
-                number,
-                title,
-                author: .user,
-                createdAt: .created_at,
-                url: .html_url,
-                assignees: [.assignees[].login] | select(length > 0),
-                reviewers: [(.requested_reviewers // [])[].login] | select(length > 0)
-            }][]')
+            prs=$(echo "$prs_with_reviews" | jq --arg user "$current_user" --arg days "$DAYS_THRESHOLD" '
+                [.[] | select(
+                    (
+                        (.assignees | map(.login) | contains([$user])) or
+                        ((.requested_reviewers // []) | map(.login) | contains([$user]))
+                    ) and
+                    (.draft | not) and
+                    (
+                        if ($days != "" and .created_at != null) then
+                            (now - ((.created_at | fromdateiso8601) // 0)) / 86400 >= ($days | tonumber)
+                        else true end
+                    )
+                ) | {
+                    number: (.number | tostring),
+                    title,
+                    author: (.user.login // "unknown"),
+                    createdAt: (.created_at // ""),
+                    url: (.html_url // ""),
+                    assignees: [.assignees[].login] | select(length > 0),
+                    reviewers: [(.requested_reviewers // [])[].login] | select(length > 0),
+                    reviews: (
+                        [.reviews[] | {state, user: .user.login}] | 
+                        if length == 0 then "pending review"
+                        elif any(.state == "CHANGES_REQUESTED") then "changes requested"
+                        elif any(.state == "APPROVED") then "approved"
+                        else "pending review"
+                        end
+                    )
+                }] | select(length > 0)'
+            )
         else
-            prs=$(gh pr list --repo "$repo" --state open --json number,title,author,createdAt,url --jq '.[]')
+            prs=$(gh pr list --repo "$repo" --state open --json number,title,author,createdAt,url,isDraft | \
+                jq --arg days "$DAYS_THRESHOLD" '[.[] | 
+                    select(
+                        (.isDraft | not) and
+                        (
+                            if ($days != "" and .createdAt != null) then
+                                (now - ((.createdAt | fromdateiso8601) // 0)) / 86400 >= ($days | tonumber)
+                            else true end
+                        )
+                    ) | {
+                    number: (.number | tostring),
+                    title,
+                    author: (.author.login // "unknown"),
+                    createdAt: (.createdAt // ""),
+                    url: (.url // "")
+                }] | select(length > 0)')
         fi
-        if [ ! -z "$prs" ]; then
+
+        if [ ! -z "$prs" ] && [ "$prs" != "[]" ] && [ "$prs" != "null" ]; then
             echo "📦 $repo"
-            while IFS= read -r pr; do
-                echo "$pr"
-                created_at=$(echo "$pr" | jq -r '.createdAt')
-                time_open=$(get_time_diff "$created_at")
-                if [ "$SHOW_INVOLVED" = true ]; then
-                    echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    👥 Assignees: \(.assignees | join(", "))\n    👀 Reviewers: \(.reviewers | join(", "))\n    🔗 \(.url)\n"'
+            echo "$prs" | jq -c '.[]' | while IFS= read -r pr; do
+                if [ -n "$(echo "$pr" | jq -r '.createdAt')" ] && [ "$(echo "$pr" | jq -r '.createdAt')" != "null" ]; then
+                    created_at=$(echo "$pr" | jq -r '.createdAt')
+                    time_open=$(get_time_diff "$created_at")
                 else
-                    echo "$pr" | jq -r --arg time "$time_open" '"  #\(.number) \(.title)\n    👤 \(.author.login) | ⏱️ \($time) ago\n    🔗 \(.url)\n"'
+                    time_open="unknown"
                 fi
-            done <<< "$prs"
-            echo
+                
+                review_status=$(echo "$pr" | jq -r '.reviews // ""')
+                status_emoji=""
+                case "$review_status" in
+                    "approved") status_emoji="✅";;
+                    "changes requested") status_emoji="❌";;
+                    "pending review") status_emoji="⏳";;
+                esac
+                
+                number=$(echo "$pr" | jq -r '.number')
+                title=$(echo "$pr" | jq -r '.title')
+                author=$(echo "$pr" | jq -r '.author')
+                url=$(echo "$pr" | jq -r '.url')
+                
+                if [ "$SHOW_INVOLVED" = true ]; then
+                    assignees=$(echo "$pr" | jq -r '.assignees[]?' 2>/dev/null | paste -sd ", " -)
+                    reviewers=$(echo "$pr" | jq -r '.reviewers[]?' 2>/dev/null | paste -sd ", " -)
+                    echo "  #$number $title $status_emoji"
+                    echo "    👤 $author | ⏱️ $time_open ago"
+                    [ ! -z "$assignees" ] && echo "    👥 Assignees: $assignees"
+                    [ ! -z "$reviewers" ] && echo "    👀 Reviewers: $reviewers"
+                    echo "    🔗 $url"
+                    echo
+                else
+                    echo "  #$number $title $status_emoji"
+                    echo "    👤 $author | ⏱️ $time_open ago"
+                    echo "    🔗 $url"
+                    echo
+                fi
+            done
         fi
     done
 fi 

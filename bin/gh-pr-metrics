@@ -23,6 +23,7 @@ PR_LIMIT=""  # No default limit
 TIMEFRAME="1m"  # Default to 1 month
 USE_CACHE=false
 CACHE_DIR="/tmp/gh-pr-metrics"
+USER_FILTER=""
 mkdir -p "$CACHE_DIR"
 
 # Function to show usage
@@ -33,6 +34,7 @@ show_usage() {
     echo "  -r, --repo REPO       Show metrics for specific repo (format: repo-name)"
     echo "  -l, --limit N         Limit number of PRs to check (default: no limit)"
     echo "  -t, --timeframe TIME  Time period to analyze: 2w, 1m, 1y (default: 1m)"
+    echo "  -u, --user USER       Filter metrics for specific user"
     echo "      --use-cache       Use cached data if available (cache valid for 1 hour)"
     echo "  -h, --help           Show this help message"
     echo ""
@@ -64,6 +66,10 @@ while [[ $# -gt 0 ]]; do
                     show_usage
                     ;;
             esac
+            ;;
+        -u|--user)
+            USER_FILTER="$2"
+            shift 2
             ;;
         --use-cache)
             USE_CACHE=true
@@ -139,8 +145,16 @@ for repo in $repos; do
     else
         pr_query="repos/$repo/pulls?state=all&sort=updated&direction=desc"
     fi
+    
+    # Add user filter to jq query if specified
+    if [ -n "$USER_FILTER" ]; then
+        user_filter="| select(.user.login == \"$USER_FILTER\")"
+    else
+        user_filter=""
+    fi
+    
     gh api "$pr_query" --jq "
-        [.[] | select(.created_at >= \"$START_DATE\") | {
+        [.[] | select(.created_at >= \"$START_DATE\") $user_filter | {
             number,
             author: .user.login,
             created_at,
@@ -151,17 +165,26 @@ for repo in $repos; do
     " >> "$PR_DATA"
     
     # Get review data for each PR
+    if [ -n "$USER_FILTER" ]; then
+        review_filter="select(.user.login == \"$USER_FILTER\")"
+    else
+        review_filter="."
+    fi
+    
     for pr_number in $(gh api "$pr_query" --jq "
         [.[] | select(.created_at >= \"$START_DATE\").number][]
     "); do
-        # echo "  Fetching reviews for PR #$pr_number..."
-        gh api "repos/$repo/pulls/$pr_number/reviews" --jq "
-            [.[] | {
+        pr_created_at=$(gh api "repos/$repo/pulls/$pr_number" --jq .created_at)
+        reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --jq "
+            [.[] | $review_filter | {
                 reviewer: .user.login,
                 submitted_at: .submitted_at,
-                pr_created_at: \"$(gh api "repos/$repo/pulls/$pr_number" --jq .created_at)\"
+                pr_created_at: \"$pr_created_at\"
             }]
-        " >> "$REVIEW_DATA" || true
+        ")
+        if [ "$reviews" != "[]" ]; then
+            echo "$reviews" >> "$REVIEW_DATA"
+        fi
     done
 done
 
@@ -251,4 +274,8 @@ jq -s '
         reviews_per_week: (length * 7.0 / (if $timeframe == "2w" then 14 elif $timeframe == "1y" then 365 else 30 end))  # Reviews per week
     }
 ' --arg timeframe "$TIMEFRAME" "$REVIEW_DATA" | \
-jq -r '"  📊 Overview:\n    Total Reviews: \(.total_reviews)\n    Active Reviewers: \(.active_reviewers)\n    Avg Time to Review: \(.avg_time_to_review | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n    Review Velocity: \(.reviews_per_week | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end) reviews/week\n"' 
+jq -r '"  📊 Overview:\n    Total Reviews: \(.total_reviews)\n    Active Reviewers: \(.active_reviewers)\n    Avg Time to Review: \(.avg_time_to_review | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end)d\n    Review Velocity: \(.reviews_per_week | (. * 10 | round / 10) | tostring | if contains(".") then . else . + ".0" end) reviews/week\n"'
+
+if [ -n "$USER_FILTER" ]; then
+    echo -e "\n📊 Metrics for user: $USER_FILTER"
+fi 
